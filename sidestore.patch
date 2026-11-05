@@ -46,7 +46,7 @@ index 6b7a4c2..f6f695b 100644
      {
          super.viewWillAppear(animated)
 diff --git a/SideStore/Core/Operations/PipelineOperations/FetchProvisioningProfilesOperation.swift b/SideStore/Core/Operations/PipelineOperations/FetchProvisioningProfilesOperation.swift
-index e0e2399..1d96c14 100644
+index e0e2399..a3c51f9 100644
 --- a/SideStore/Core/Operations/PipelineOperations/FetchProvisioningProfilesOperation.swift
 +++ b/SideStore/Core/Operations/PipelineOperations/FetchProvisioningProfilesOperation.swift
 @@ -33,6 +33,12 @@ class FetchProvisioningProfilesOperation: BasePipelineOperation<InstallAppOperat
@@ -70,10 +70,10 @@ index e0e2399..1d96c14 100644
 +            for watch in watches {
 +                for target in [watch] + (try watch.watchExtensions()) {
 +                    let watchProfile = try await provisionAndFetchProfile(for: target, parentAppBundle: targetAppBundle, team: team, deviceType: .watch)
-+                    let suffix = String(target.bundleIdentifier.dropFirst(targetAppBundle.bundleIdentifier.count))
-+                    let requestedID = effectiveBundleId + suffix
++                    let requestedID = try targetAppBundle.embeddedProfileIdentifier(for: target.bundleIdentifier, replacingHostWith: effectiveBundleId)
++                    let signedID = try targetAppBundle.embeddedProfileIdentifier(for: target.bundleIdentifier, replacingHostWith: profile.bundleIdentifier)
 +                    guard profiles[requestedID] == nil,
-+                          watchProfile.bundleIdentifier == profile.bundleIdentifier + suffix,
++                          watchProfile.bundleIdentifier == signedID,
 +                          watchProfile.teamIdentifier == team.identifier,
 +                          watchProfile.expirationDate > Date(),
 +                          watchProfile.deviceIDs.contains(where: { $0.caseInsensitiveCompare(watchID) == .orderedSame }),
@@ -121,7 +121,20 @@ index e0e2399..1d96c14 100644
          let parentID: String
          if let preferredBundleID = await self.getPreferredBundleID(for: targetAppBundle, team: team) {
              parentID = preferredBundleID
-@@ -185,7 +227,7 @@ class FetchProvisioningProfilesOperation: BasePipelineOperation<InstallAppOperat
+@@ -154,11 +196,7 @@ class FetchProvisioningProfilesOperation: BasePipelineOperation<InstallAppOperat
+ 
+         let bundleID: String
+         if let parentAppBundle = parentAppBundle {
+-            guard targetAppBundle.bundleIdentifier.hasPrefix(parentAppBundle.bundleIdentifier + ".") else {
+-                throw OperationError.invalidApp(reason: "Extension bundle ID '\(targetAppBundle.bundleIdentifier)' does not start with parent bundle ID '\(parentAppBundle.bundleIdentifier)'.")
+-            }
+-            let suffix = String(targetAppBundle.bundleIdentifier.dropFirst(parentAppBundle.bundleIdentifier.count))
+-            bundleID = parentID + suffix
++            bundleID = try parentAppBundle.embeddedProfileIdentifier(for: targetAppBundle.bundleIdentifier, replacingHostWith: parentID)
+             self.debugLog("[FetchProvisioningProfiles] Extension bundleID with suffix: \(bundleID)")
+         } else {
+             bundleID = parentID
+@@ -185,7 +223,7 @@ class FetchProvisioningProfilesOperation: BasePipelineOperation<InstallAppOperat
          
          verboseLog(targetAppBundle.dumpMachOInfo())
          self.debugLog("[FetchProvisioningProfiles] Fetching provisioning profile from Apple for App ID \(groupAppID.bundleIdentifier)...")
@@ -147,7 +160,7 @@ index cf721ec..18dd1a5 100644
                                     installedApp.storeApp?.bundleIdentifier.range(of: Bundle.Info.appbundleIdentifier) != nil
              if isSelfReinstall {
 diff --git a/SideStore/Core/Operations/PipelineOperations/ResignAppOperation.swift b/SideStore/Core/Operations/PipelineOperations/ResignAppOperation.swift
-index 970338f..01fa62b 100644
+index 970338f..f658a79 100644
 --- a/SideStore/Core/Operations/PipelineOperations/ResignAppOperation.swift
 +++ b/SideStore/Core/Operations/PipelineOperations/ResignAppOperation.swift
 @@ -42,7 +42,12 @@ final class ResignAppOperation: BasePipelineOperation<InstallAppOperationContext
@@ -173,7 +186,7 @@ index 970338f..01fa62b 100644
              finalBundleIdentifier = profile.bundleIdentifier
          } else {
              finalBundleIdentifier = bundleIdentifier
-@@ -114,6 +119,40 @@ final class ResignAppOperation: BasePipelineOperation<InstallAppOperationContext
+@@ -114,6 +119,39 @@ final class ResignAppOperation: BasePipelineOperation<InstallAppOperationContext
              try self.prepare(appExtension, bundleID: updatedAppExBundleId, profiles: profiles, appexBundleIds: appexBundleIds)
          }
          
@@ -182,10 +195,9 @@ index 970338f..01fa62b 100644
 +            // are handled identically on the first install and subsequent full refreshes.
 +            let nested = try watch.watchExtensions()
 +            func signedID(for target: ALTApplication) throws -> String {
-+                guard target.bundleIdentifier.hasPrefix(appBundle.bundleIdentifier + ".") else {
-+                    throw OperationError.invalidApp(reason: "Unexpected Watch bundle identifier: \(target.bundleIdentifier)")
-+                }
-+                let key = bundleIdentifier + String(target.bundleIdentifier.dropFirst(appBundle.bundleIdentifier.count))
++                // The staged host plist may already contain its signed ID during a refresh.
++                // Use the same source host that FetchProvisioningProfilesOperation used.
++                let key = try targetAppBundle.embeddedProfileIdentifier(for: target.bundleIdentifier, replacingHostWith: bundleIdentifier)
 +                guard let profile = profiles[key] else {
 +                    throw OperationError.missingProvisioningProfile(reason: "Missing Watch profile for \(target.bundleIdentifier)")
 +                }
@@ -214,7 +226,7 @@ index 970338f..01fa62b 100644
          return appBundleURL
      }
      
-@@ -121,7 +160,7 @@ final class ResignAppOperation: BasePipelineOperation<InstallAppOperationContext
+@@ -121,7 +159,7 @@ final class ResignAppOperation: BasePipelineOperation<InstallAppOperationContext
          guard let identifier else {
              throw OperationError.invalidParameters("Bundle is missing bundle identifier.")
          }

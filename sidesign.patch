@@ -114,10 +114,10 @@ index 6c68dab..2d3f740 100644
              parameters["subPlatform"] = "tvOS"
          } else if deviceType.contains(.mac) {
 diff --git a/Sources/Models/AppBundle.swift b/Sources/Models/AppBundle.swift
-index acf0c02..40c8292 100644
+index acf0c02..0c785c0 100644
 --- a/Sources/Models/AppBundle.swift
 +++ b/Sources/Models/AppBundle.swift
-@@ -34,6 +34,41 @@ public struct AppBundle: Sendable, Identifiable, Hashable, Equatable {
+@@ -34,6 +34,50 @@ public struct AppBundle: Sendable, Identifiable, Hashable, Equatable {
          loadExtensions()
      }
  
@@ -128,6 +128,15 @@ index acf0c02..40c8292 100644
 +
 +    public func watchExtensions() throws -> [AppBundle] {
 +        try nestedBundles(in: "PlugIns", extension: "appex")
++    }
++
++    /// Translate a nested identifier using the host as it was read from the source IPA.
++    public func embeddedProfileIdentifier(for childID: String, replacingHostWith newHostID: String) throws -> String {
++        let prefix = bundleIdentifier + "."
++        guard childID.hasPrefix(prefix), childID.count > prefix.count else {
++            throw SignerError.invalidApp(cause: "Embedded identifier '\(childID)' is outside source host '\(bundleIdentifier)'.")
++        }
++        return newHostID + childID.dropFirst(bundleIdentifier.count)
 +    }
 +
 +    private func nestedBundles(in folder: String, extension suffix: String) throws -> [AppBundle] {
@@ -173,15 +182,37 @@ index 81e54fe..969d109 100644
  import CodeSignKit
 diff --git a/Tests/SideSignTests/WatchCompanionTests.swift b/Tests/SideSignTests/WatchCompanionTests.swift
 new file mode 100644
-index 0000000..270955e
+index 0000000..2545e32
 --- /dev/null
 +++ b/Tests/SideSignTests/WatchCompanionTests.swift
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,55 @@
 +import Foundation
 +import XCTest
 +@testable import SideSign
 +
 +final class WatchCompanionTests: XCTestCase {
++    func testRefreshUsesSourceHostAfterStagedHostIdentifierChanges() throws {
++        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathComponent("Host.app")
++        defer { try? FileManager.default.removeItem(at: directory.deletingLastPathComponent()) }
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++        func writeHost(_ id: String) throws {
++            try InfoPlistParser(dictionary: ["CFBundleIdentifier": id, "CFBundlePackageType": "APPL"]).write(to: directory.appendingPathComponent("Info.plist"))
++        }
++        try writeHost("org.example.phone")
++        let source = try XCTUnwrap(AppBundle(fileURL: directory))
++        let child = "org.example.phone.watch"
++        let requested = "dev.custom.phone"
++        let signed = requested + ".TEAM"
++        let key = try source.embeddedProfileIdentifier(for: child, replacingHostWith: requested)
++        let profiles = [key: try source.embeddedProfileIdentifier(for: child, replacingHostWith: signed)]
++        try writeHost(signed)
++        let staged = try XCTUnwrap(AppBundle(fileURL: directory))
++        XCTAssertThrowsError(try staged.embeddedProfileIdentifier(for: child, replacingHostWith: requested))
++        XCTAssertEqual(profiles[try source.embeddedProfileIdentifier(for: child, replacingHostWith: requested)], signed + ".watch")
++        XCTAssertEqual(try source.embeddedProfileIdentifier(for: child + ".ext", replacingHostWith: signed), signed + ".watch.ext")
++        XCTAssertThrowsError(try source.embeddedProfileIdentifier(for: "org.example.phone2.watch", replacingHostWith: signed))
++    }
++
 +    func testDiscoversWatchAndItsExtensionsSeparatelyFromPhonePlugins() throws {
 +        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
 +        defer { try? FileManager.default.removeItem(at: temp) }
