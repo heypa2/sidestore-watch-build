@@ -100,18 +100,9 @@ index 6c68dab..2d3f740 100644
              parameters["subPlatform"] = "tvOS"
          } else if deviceType.contains(.mac) {
 diff --git a/Sources/Models/AppBundle.swift b/Sources/Models/AppBundle.swift
-index acf0c02..fe77604 100644
+index acf0c02..be483d4 100644
 --- a/Sources/Models/AppBundle.swift
 +++ b/Sources/Models/AppBundle.swift
-@@ -3,7 +3,7 @@
- //  SideSign
- //
- //  Created by Magesh K on 30/08/26.
--//  Copyright © 2026 SideSign. All rights reserved.
-+//  Copyright 漏 2026 SideSign. All rights reserved.
- //
- 
- import Foundation
 @@ -34,6 +34,33 @@ public struct AppBundle: Sendable, Identifiable, Hashable, Equatable {
          loadExtensions()
      }
@@ -146,6 +137,18 @@ index acf0c02..fe77604 100644
      public var isExtension: Bool {
          fileURL.pathExtension.lowercased() == "appex"
      }
+diff --git a/Tests/SideSignTests/SideSignTests.swift b/Tests/SideSignTests/SideSignTests.swift
+index 81e54fe..969d109 100644
+--- a/Tests/SideSignTests/SideSignTests.swift
++++ b/Tests/SideSignTests/SideSignTests.swift
+@@ -6,6 +6,7 @@
+ //  Copyright © 2026 SideSign. All rights reserved.
+ //
+ 
++import Foundation
+ import Testing
+ @testable import SideSign
+ import CodeSignKit
 diff --git a/Tests/SideSignTests/WatchCompanionTests.swift b/Tests/SideSignTests/WatchCompanionTests.swift
 new file mode 100644
 index 0000000..020308c

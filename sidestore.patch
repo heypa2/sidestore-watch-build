@@ -147,18 +147,9 @@ index cf721ec..18dd1a5 100644
                                     installedApp.storeApp?.bundleIdentifier.range(of: Bundle.Info.appbundleIdentifier) != nil
              if isSelfReinstall {
 diff --git a/SideStore/Core/Operations/PipelineOperations/ResignAppOperation.swift b/SideStore/Core/Operations/PipelineOperations/ResignAppOperation.swift
-index 970338f..cfcd4d9 100644
+index 970338f..01fa62b 100644
 --- a/SideStore/Core/Operations/PipelineOperations/ResignAppOperation.swift
 +++ b/SideStore/Core/Operations/PipelineOperations/ResignAppOperation.swift
-@@ -3,7 +3,7 @@
- //  AltStore
- //
- //  Created by Riley Testut on 6/7/19.
--//  Copyright © 2019 Riley Testut. All rights reserved.
-+//  Copyright 漏 2019 Riley Testut. All rights reserved.
- //
- 
- @preconcurrency import UIKit
 @@ -42,7 +42,12 @@ final class ResignAppOperation: BasePipelineOperation<InstallAppOperationContext
          
          self.setProgress(40)
