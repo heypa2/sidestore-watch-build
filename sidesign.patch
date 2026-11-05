@@ -1,14 +1,13 @@
 diff --git a/Sources/CodeSigning/CodeSignerAPI.swift b/Sources/CodeSigning/CodeSignerAPI.swift
-index c43fd90..71d75f0 100644
+index c43fd90..5c0bf97 100644
 --- a/Sources/CodeSigning/CodeSignerAPI.swift
 +++ b/Sources/CodeSigning/CodeSignerAPI.swift
-@@ -74,10 +74,15 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
+@@ -74,10 +74,14 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
          debugLog("[SideSign] AppBundleSigner.signApp started")
          verboseLog("[SideSign] BundleID: \(appBundle.bundleIdentifier)")
  
 +        let watchApps = try appBundle.watchApplications()
 +        let watchTargets = try watchApps.flatMap { watch in [watch] + (try watch.watchExtensions()) }
-+        let watchRoot = appBundle.fileURL.appendingPathComponent("Watch").resolvingSymlinksInPath()
 +
          func profile(for app: AppBundle) -> ProvisioningProfile? {
              for p in profiles where p.bundleIdentifier == app.bundleIdentifier {
@@ -18,7 +17,7 @@ index c43fd90..71d75f0 100644
              return profiles.first
          }
  
-@@ -111,6 +116,11 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
+@@ -111,6 +115,11 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
                                  verboseLog("[SideSign] Group: '\(group)'")
                                  throw SignerError.invalidApp(cause: "The keychain access group '\(group)' does not contain a Team ID prefix.")
                              }
@@ -30,39 +29,54 @@ index c43fd90..71d75f0 100644
                              return matchedProfile.teamIdentifier + group[separator...]
                          }
                      }
-@@ -151,6 +161,20 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
+@@ -151,6 +160,22 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
                  try prepare(ext)
              }
  
-+            for target in watchTargets {
-+                try prepare(target)
-+            }
 +            var watchEntitlements: [String: String] = [:]
 +            for target in watchTargets {
++                try prepare(target)
 +                guard let executable = target.infoPlist["CFBundleExecutable"] as? String,
 +                      let xml = entitlementsByURL[target.fileURL.resolvingSymlinksInPath()] else {
 +                    throw SignerError.invalidApp(cause: "Invalid Watch executable in \(target.bundleIdentifier)")
 +                }
-+                let root = target.fileURL.resolvingSymlinksInPath()
-+                watchEntitlements[root.path] = xml
-+                watchEntitlements[root.appendingPathComponent(executable).path] = xml
++                // CodeSignKit supplies paths relative to the host app. Compare components so
++                // directory URL formatting and aliases for temporary directories do not affect signing.
++                let components = target.fileURL.path.split(separator: "/")
++                let count = target.isExtension ? 4 : 2
++                let relative = components.suffix(count).joined(separator: "/")
++                watchEntitlements[relative] = xml
++                watchEntitlements[relative + "/" + executable] = xml
 +            }
 +            let sealedWatchEntitlements = watchEntitlements
              let keyData = try keyStore.exportP12()
  
              verboseLog("[SideSign] Invoking CodeSigner.sign for appPath: \(appBundle.fileURL.path)")
-@@ -171,6 +195,11 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
-                         let url: URL = normPath.hasPrefix("/") ? URL(fileURLWithPath: normPath) : appBundle.fileURL.appendingPathComponent(normPath)
-                         let resolved = url.resolvingSymlinksInPath()
+@@ -159,6 +184,10 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
+                 keyData: keyData,
+                 entitlementProvider: { path in
+                     let normPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
++                    if normPath.hasPrefix("Watch/") {
++                        let relative = normPath.split(separator: "/").joined(separator: "/")
++                        return sealedWatchEntitlements[relative] ?? ""
++                    }
+                     let appResolved = appBundle.fileURL.resolvingSymlinksInPath()
  
-+                        if !watchApps.isEmpty && resolved.path.hasPrefix(watchRoot.path + "/") {
-+                            // CodeSignKit visits children before their parents. Frameworks and loose
-+                            // libraries inside a watch app must not inherit application entitlements.
-+                            return sealedWatchEntitlements[resolved.path] ?? ""
-+                        }
-                         if resolved == appResolved {
-                             targetType = .mainAppBundleDirectory
-                             xml = entitlementsByURL[appResolved] ?? ""
+                     let targetType: SigningTargetType
+@@ -213,6 +242,13 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
+                 }
+             )
+ 
++            for target in watchTargets {
++                guard let expected = profile(for: target)?.entitlements["application-identifier"] as? String,
++                      let actual = target.entitlements["application-identifier"] as? String,
++                      actual == expected else {
++                    throw SignerError.invalidApp(cause: "Signed Watch executable does not match the provisioning profile for \(target.bundleIdentifier).")
++                }
++            }
+             debugLog("[SideSign] AppBundleSigner.signApp completed successfully")
+             verboseLog("[SideSign] App URL: \(appURL.path)")
+         } catch {
 diff --git a/Sources/DeveloperPortal/Devices.swift b/Sources/DeveloperPortal/Devices.swift
 index 98b0659..ab6d90b 100644
 --- a/Sources/DeveloperPortal/Devices.swift
@@ -100,10 +114,10 @@ index 6c68dab..2d3f740 100644
              parameters["subPlatform"] = "tvOS"
          } else if deviceType.contains(.mac) {
 diff --git a/Sources/Models/AppBundle.swift b/Sources/Models/AppBundle.swift
-index acf0c02..be483d4 100644
+index acf0c02..40c8292 100644
 --- a/Sources/Models/AppBundle.swift
 +++ b/Sources/Models/AppBundle.swift
-@@ -34,6 +34,33 @@ public struct AppBundle: Sendable, Identifiable, Hashable, Equatable {
+@@ -34,6 +34,41 @@ public struct AppBundle: Sendable, Identifiable, Hashable, Equatable {
          loadExtensions()
      }
  
@@ -117,17 +131,25 @@ index acf0c02..be483d4 100644
 +    }
 +
 +    private func nestedBundles(in folder: String, extension suffix: String) throws -> [AppBundle] {
-+        let root = fileURL.resolvingSymlinksInPath()
-+        let container = root.appendingPathComponent(folder)
-+        guard FileManager.default.fileExists(atPath: container.path) else { return [] }
-+        guard container.resolvingSymlinksInPath().path == container.path else {
++        let files = FileManager.default
++        let container = fileURL.appendingPathComponent(folder)
++        let attributes: [FileAttributeKey: Any]
++        do {
++            attributes = try files.attributesOfItem(atPath: container.path)
++        } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
++            return []
++        }
++        guard attributes[.type] as? FileAttributeType == .typeDirectory else {
 +            throw SignerError.invalidApp(cause: "Invalid nested bundle directory: \(folder)")
 +        }
-+        let children = try FileManager.default.contentsOfDirectory(at: container, includingPropertiesForKeys: nil)
++        let children = try files.contentsOfDirectory(at: container, includingPropertiesForKeys: nil)
 +        return try children.filter { $0.pathExtension.lowercased() == suffix }
 +            .sorted { $0.path < $1.path }.map { url in
-+                guard url.resolvingSymlinksInPath().path == url.path,
-+                      let bundle = AppBundle(fileURL: url) else {
++                let type = try files.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType
++                guard type == .typeDirectory else {
++                    throw SignerError.invalidApp(cause: "Embedded target must be a directory: \(url.lastPathComponent)")
++                }
++                guard let bundle = AppBundle(fileURL: url) else {
 +                    throw SignerError.invalidApp(cause: "Invalid embedded bundle: \(url.lastPathComponent)")
 +                }
 +                return bundle
@@ -151,10 +173,10 @@ index 81e54fe..969d109 100644
  import CodeSignKit
 diff --git a/Tests/SideSignTests/WatchCompanionTests.swift b/Tests/SideSignTests/WatchCompanionTests.swift
 new file mode 100644
-index 0000000..020308c
+index 0000000..270955e
 --- /dev/null
 +++ b/Tests/SideSignTests/WatchCompanionTests.swift
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,33 @@
 +import Foundation
 +import XCTest
 +@testable import SideSign
@@ -179,6 +201,10 @@ index 0000000..020308c
 +        XCTAssertEqual(try host.watchApplications().map(\.bundleIdentifier), [watch.bundleIdentifier])
 +        XCTAssertEqual(try watch.watchExtensions().map(\.bundleIdentifier), [ext.bundleIdentifier])
 +        XCTAssertEqual(host.appExtensions.map(\.bundleIdentifier), ["org.example.phone.widget"])
++        let link = host.fileURL.appendingPathComponent("Watch/Linked.app")
++        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: watch.fileURL)
++        XCTAssertThrowsError(try host.watchApplications())
++        try FileManager.default.removeItem(at: link)
 +        let bad = host.fileURL.appendingPathComponent("Watch/Broken.app")
 +        try FileManager.default.createDirectory(at: bad, withIntermediateDirectories: true)
 +        XCTAssertThrowsError(try host.watchApplications())
