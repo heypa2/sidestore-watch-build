@@ -1,0 +1,258 @@
+diff --git a/AltStore/Settings/SettingsViewController.swift b/AltStore/Settings/SettingsViewController.swift
+index 6b7a4c2..f6f695b 100644
+--- a/AltStore/Settings/SettingsViewController.swift
++++ b/AltStore/Settings/SettingsViewController.swift
+@@ -225,6 +225,10 @@ final class SettingsViewController: UITableViewController
+     override func viewDidLoad()
+     {
+         super.viewDidLoad()
++        #if os(iOS)
++        let watchButton = UIBarButtonItem(title: "Apple Watch", style: .plain, target: self, action: #selector(configureWatchSigning))
++        navigationItem.rightBarButtonItems = (navigationItem.rightBarButtonItems ?? []) + [watchButton]
++        #endif
+         
+         #if !os(tvOS)
+         // --- iOS 26 fix ---
+@@ -286,6 +290,31 @@ final class SettingsViewController: UITableViewController
+         configureReleaseChannelButton()
+     }
+     
++    @objc private func configureWatchSigning() {
++        let key = "watchSigningDeviceUDID"
++        let alert = UIAlertController(title: "Apple Watch signing", message: "Enter the UDID of your paired Apple Watch. Installing or refreshing a companion app will register this watch with your signing team. Clear the field to forget it.", preferredStyle: .alert)
++        alert.addTextField {
++            $0.placeholder = "Apple Watch UDID"
++            $0.text = UserDefaults.standard.string(forKey: key)
++            $0.autocorrectionType = .no
++            $0.autocapitalizationType = .none
++        }
++        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
++        alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self, weak alert] _ in
++            let value = (alert?.textFields?.first?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
++            if value.isEmpty {
++                UserDefaults.standard.removeObject(forKey: key)
++            } else if value.range(of: #"^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16})$"#, options: .regularExpression) != nil {
++                UserDefaults.standard.set(value.uppercased(), forKey: key)
++            } else {
++                let error = UIAlertController(title: "Invalid watch UDID", message: "Use the device identifier from Xcode or a pairing tool, rather than the watch serial number.", preferredStyle: .alert)
++                error.addAction(UIAlertAction(title: "OK", style: .default))
++                self?.present(error, animated: true)
++            }
++        })
++        present(alert, animated: true)
++    }
++
+     override func viewWillAppear(_ animated: Bool)
+     {
+         super.viewWillAppear(animated)
+diff --git a/SideStore/Core/Operations/PipelineOperations/FetchProvisioningProfilesOperation.swift b/SideStore/Core/Operations/PipelineOperations/FetchProvisioningProfilesOperation.swift
+index e0e2399..1d96c14 100644
+--- a/SideStore/Core/Operations/PipelineOperations/FetchProvisioningProfilesOperation.swift
++++ b/SideStore/Core/Operations/PipelineOperations/FetchProvisioningProfilesOperation.swift
+@@ -33,6 +33,12 @@ class FetchProvisioningProfilesOperation: BasePipelineOperation<InstallAppOperat
+         let effectiveBundleId = self.context.targetBundleIdentifier
+ 
+         let appExtensions = targetAppBundle.appExtensions
++        let watches = try targetAppBundle.watchApplications()
++        if !watches.isEmpty && self.context.overrideProvisioningProfile != nil {
++            throw OperationError.invalidApp(reason: "Watch companions require automatic provisioning for each embedded target. Remove the profile override and retry.")
++        }
++        let watchID = watches.isEmpty ? nil : try await registeredWatchID()
++
+ 
+         if let overrideProfile = self.context.overrideProvisioningProfile {
+             self.debugLog("[FetchProvisioningProfiles] Using override provisioning profile '\(overrideProfile.name)' (\(overrideProfile.uuid)) for \(effectiveBundleId)")
+@@ -58,6 +64,25 @@ class FetchProvisioningProfilesOperation: BasePipelineOperation<InstallAppOperat
+         self.debugLog("[FetchProvisioningProfiles] Main profile prepared successfully for \(effectiveBundleId), expiration: \(String(describing: profile.expirationDate))")
+         
+         var profiles = [effectiveBundleId: profile]
++        if let watchID {
++            for watch in watches {
++                for target in [watch] + (try watch.watchExtensions()) {
++                    let watchProfile = try await provisionAndFetchProfile(for: target, parentAppBundle: targetAppBundle, team: team, deviceType: .watch)
++                    let suffix = String(target.bundleIdentifier.dropFirst(targetAppBundle.bundleIdentifier.count))
++                    let requestedID = effectiveBundleId + suffix
++                    guard profiles[requestedID] == nil,
++                          watchProfile.bundleIdentifier == profile.bundleIdentifier + suffix,
++                          watchProfile.teamIdentifier == team.identifier,
++                          watchProfile.expirationDate > Date(),
++                          watchProfile.deviceIDs.contains(where: { $0.caseInsensitiveCompare(watchID) == .orderedSame }),
++                          let certificate = context.targetSigningCertificate,
++                          watchProfile.certificates.contains(where: { $0.serialNumberHex == certificate.certificate.serialNumberHex }) else {
++                        throw OperationError.invalidApp(reason: "The profile for \(target.bundleIdentifier) must authorize the selected Apple Watch, the signing certificate and the new bundle identifier.")
++                    }
++                    profiles[requestedID] = watchProfile
++                }
++            }
++        }
+         
+         guard !self.context.useMainProfile, !appExtensions.isEmpty else {
+             self.setProgress(100)
+@@ -101,6 +126,22 @@ class FetchProvisioningProfilesOperation: BasePipelineOperation<InstallAppOperat
+     }
+ 
+ 
++    private func registeredWatchID() async throws -> String {
++        guard let udid = UserDefaults.standard.string(forKey: "watchSigningDeviceUDID"),
++              udid.range(of: #"^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16})$"#, options: .regularExpression) != nil else {
++            throw OperationError.invalidApp(reason: "Open Settings → Apple Watch and enter your paired watch’s UDID before signing a companion app.")
++        }
++        let team = try await AuthManager.shared.getAuthenticatedTeam()
++        return try await TaskChainCoalescer.shared.coalesce(key: "watch-registration-\(team.identifier)-\(udid)") {
++            let portal = DeveloperPortalProxy.shared
++            let devices = try await portal.fetchDevices(for: team, types: .watch)
++            if !devices.contains(where: { $0.identifier.caseInsensitiveCompare(udid) == .orderedSame }) {
++                _ = try await portal.registerDevice(name: "Apple Watch", identifier: udid, type: .watch, team: team)
++            }
++            return udid
++        }
++    }
++
+     private func getPreferredBundleID(for targetAppBundle: ALTApplication, team: ALTTeam) async -> String? {
+         await DatabaseManager.shared.persistentContainer.performBackgroundTask { [weak self] (context) -> String? in
+             guard let self else { return nil }
+@@ -142,7 +183,8 @@ class FetchProvisioningProfilesOperation: BasePipelineOperation<InstallAppOperat
+     
+     private func provisionAndFetchProfile(for targetAppBundle: ALTApplication,
+                                           parentAppBundle: ALTApplication?,
+-                                          team: ALTTeam) async throws -> ALTProvisioningProfile {
++                                          team: ALTTeam,
++                                          deviceType: ALTDeviceType = DeveloperPortalProxy.currentDeviceType) async throws -> ALTProvisioningProfile {
+         let parentID: String
+         if let preferredBundleID = await self.getPreferredBundleID(for: targetAppBundle, team: team) {
+             parentID = preferredBundleID
+@@ -185,7 +227,7 @@ class FetchProvisioningProfilesOperation: BasePipelineOperation<InstallAppOperat
+         
+         verboseLog(targetAppBundle.dumpMachOInfo())
+         self.debugLog("[FetchProvisioningProfiles] Fetching provisioning profile from Apple for App ID \(groupAppID.bundleIdentifier)...")
+-        let profile = try await DeveloperPortalProxy.shared.downloadProvisioningProfile(for: groupAppID, deviceType: DeveloperPortalProxy.currentDeviceType, team: team)
++        let profile = try await DeveloperPortalProxy.shared.downloadProvisioningProfile(for: groupAppID, deviceType: deviceType, team: team)
+         self.debugLog("[FetchProvisioningProfiles] Provisioning profile fetched for \(groupAppID.bundleIdentifier) (Name: \(profile.name), Expiration: \(String(describing: profile.expirationDate)))")
+         return profile
+     }
+diff --git a/SideStore/Core/Operations/PipelineOperations/InstallAppOperation.swift b/SideStore/Core/Operations/PipelineOperations/InstallAppOperation.swift
+index cf721ec..18dd1a5 100644
+--- a/SideStore/Core/Operations/PipelineOperations/InstallAppOperation.swift
++++ b/SideStore/Core/Operations/PipelineOperations/InstallAppOperation.swift
+@@ -149,6 +149,11 @@ final class InstallAppOperation: BasePipelineOperation<InstallAppOperationContex
+             }
+             
+             // This preserves our data in a serilized format that will be restored at boot onyl if installtion actually completed indicated by embedded provision uuid being different.
++            if !(try resignedAppBundle.watchApplications()).isEmpty,
++               let firstExpiry = provisioningProfiles.values.map(\.expirationDate).min() {
++                installedApp.expirationDate = min(installedApp.expirationDate, firstExpiry)
++            }
++
+             let isSelfReinstall = !isDifferentSideStore &&
+                                    installedApp.storeApp?.bundleIdentifier.range(of: Bundle.Info.appbundleIdentifier) != nil
+             if isSelfReinstall {
+diff --git a/SideStore/Core/Operations/PipelineOperations/ResignAppOperation.swift b/SideStore/Core/Operations/PipelineOperations/ResignAppOperation.swift
+index 970338f..cfcd4d9 100644
+--- a/SideStore/Core/Operations/PipelineOperations/ResignAppOperation.swift
++++ b/SideStore/Core/Operations/PipelineOperations/ResignAppOperation.swift
+@@ -3,7 +3,7 @@
+ //  AltStore
+ //
+ //  Created by Riley Testut on 6/7/19.
+-//  Copyright © 2019 Riley Testut. All rights reserved.
++//  Copyright 漏 2019 Riley Testut. All rights reserved.
+ //
+ 
+ @preconcurrency import UIKit
+@@ -42,7 +42,12 @@ final class ResignAppOperation: BasePipelineOperation<InstallAppOperationContext
+         
+         self.setProgress(40)
+         
+-        let resignedAppURL = try await self.resignAppBundle(at: appBundleURL, team: team, certificate: certificate, profiles: Array(profiles.values))
++        guard let hostProfile = profiles[effectiveBundleId] else {
++            throw OperationError.missingProvisioningProfile(reason: "Missing host profile for \(effectiveBundleId).")
++        }
++        // SideSign uses the first profile for extensions sharing the host profile.
++        let signingProfiles = [hostProfile] + profiles.filter { $0.key != effectiveBundleId }.map(\.value)
++        let resignedAppURL = try await self.resignAppBundle(at: appBundleURL, team: team, certificate: certificate, profiles: signingProfiles)
+         guard let resignedAppBundle = ALTApplication(fileURL: resignedAppURL) else {
+             throw OperationError.invalidApp(reason: "Could not load resigned app bundle at '\(resignedAppURL.lastPathComponent)'")
+         }
+@@ -58,7 +63,7 @@ final class ResignAppOperation: BasePipelineOperation<InstallAppOperationContext
+ 
+         let bundleIdentifier = context.targetBundleIdentifier
+         let finalBundleIdentifier: String
+-        if let profile = context.useMainProfile ? profiles.values.first : profiles[bundleIdentifier] {
++        if let profile = profiles[bundleIdentifier] {
+             finalBundleIdentifier = profile.bundleIdentifier
+         } else {
+             finalBundleIdentifier = bundleIdentifier
+@@ -114,6 +119,40 @@ final class ResignAppOperation: BasePipelineOperation<InstallAppOperationContext
+             try self.prepare(appExtension, bundleID: updatedAppExBundleId, profiles: profiles, appexBundleIds: appexBundleIds)
+         }
+         
++        for watch in try appBundle.watchApplications() {
++            // Both IDs come from Apple-issued profiles, so custom host IDs and team suffixes
++            // are handled identically on the first install and subsequent full refreshes.
++            let nested = try watch.watchExtensions()
++            func signedID(for target: ALTApplication) throws -> String {
++                guard target.bundleIdentifier.hasPrefix(appBundle.bundleIdentifier + ".") else {
++                    throw OperationError.invalidApp(reason: "Unexpected Watch bundle identifier: \(target.bundleIdentifier)")
++                }
++                let key = bundleIdentifier + String(target.bundleIdentifier.dropFirst(appBundle.bundleIdentifier.count))
++                guard let profile = profiles[key] else {
++                    throw OperationError.missingProvisioningProfile(reason: "Missing Watch profile for \(target.bundleIdentifier)")
++                }
++                return profile.bundleIdentifier
++            }
++            let signedWatchID = try signedID(for: watch)
++            let watchParser = try InfoPlistParser(plistURL: watch.infoPlistURL)
++            var watchInfo = watchParser.rawDictionary as [String: Any]
++            watchInfo["CFBundleIdentifier"] = signedWatchID
++            watchInfo["WKCompanionAppBundleIdentifier"] = finalBundleIdentifier
++            try InfoPlistParser(dictionary: watchInfo).write(to: watch.infoPlistURL)
++            for ext in nested {
++                let parser = try InfoPlistParser(plistURL: ext.infoPlistURL)
++                var info = parser.rawDictionary as [String: Any]
++                info["CFBundleIdentifier"] = try signedID(for: ext)
++                if var extensionInfo = info["NSExtension"] as? [String: Any],
++                   var attributes = extensionInfo["NSExtensionAttributes"] as? [String: Any],
++                   attributes["WKAppBundleIdentifier"] != nil {
++                    attributes["WKAppBundleIdentifier"] = signedWatchID
++                    extensionInfo["NSExtensionAttributes"] = attributes
++                    info["NSExtension"] = extensionInfo
++                }
++                try InfoPlistParser(dictionary: info).write(to: ext.infoPlistURL)
++            }
++        }
+         return appBundleURL
+     }
+     
+@@ -121,7 +160,7 @@ final class ResignAppOperation: BasePipelineOperation<InstallAppOperationContext
+         guard let identifier else {
+             throw OperationError.invalidParameters("Bundle is missing bundle identifier.")
+         }
+-        guard let profile = context.useMainProfile ? profiles.values.first : profiles[identifier] else {
++        guard let profile = context.useMainProfile ? profiles[context.targetBundleIdentifier] : profiles[identifier] else {
+             throw OperationError.missingProvisioningProfile(reason: "No provisioning profile found for identifier '\(identifier)'.")
+         }
+         guard var parser = try? InfoPlistParser(plistURL: appBundle.infoPlistURL) else {
+diff --git a/SideStore/Core/Operations/PipelineRunner.swift b/SideStore/Core/Operations/PipelineRunner.swift
+index a76344e..fc2167c 100644
+--- a/SideStore/Core/Operations/PipelineRunner.swift
++++ b/SideStore/Core/Operations/PipelineRunner.swift
+@@ -310,8 +310,18 @@ final class PipelineRunner: Sendable
+         }
+     }
+     
+-    private func performPipeline(for operation: AppOperation, handler: PipelineExecutionHandler, group: RefreshGroup, operationsCount: Int = 1) async throws -> InstalledApp
++    private func performPipeline(for requestedOperation: AppOperation, handler: PipelineExecutionHandler, group: RefreshGroup, operationsCount: Int = 1) async throws -> InstalledApp
+     {
++        let operation: AppOperation
++        if case .refresh(let app) = requestedOperation,
++           let cached = ALTApplication(fileURL: app.fileURL),
++           !(try cached.watchApplications()).isEmpty {
++            // Profile-only refresh injects into the phone. A companion needs a newly
++            // signed Watch bundle delivered with a full host update.
++            operation = .resign(app, alternateIconMode: .preserve)
++        } else {
++            operation = requestedOperation
++        }
+         let pipelineSteps = PipelineStepDefinition.steps(for: operation)
+         let context = InstallAppOperationContext(
+             pipelineSteps: pipelineSteps,

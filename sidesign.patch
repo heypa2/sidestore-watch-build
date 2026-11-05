@@ -1,0 +1,183 @@
+diff --git a/Sources/CodeSigning/CodeSignerAPI.swift b/Sources/CodeSigning/CodeSignerAPI.swift
+index c43fd90..71d75f0 100644
+--- a/Sources/CodeSigning/CodeSignerAPI.swift
++++ b/Sources/CodeSigning/CodeSignerAPI.swift
+@@ -74,10 +74,15 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
+         debugLog("[SideSign] AppBundleSigner.signApp started")
+         verboseLog("[SideSign] BundleID: \(appBundle.bundleIdentifier)")
+ 
++        let watchApps = try appBundle.watchApplications()
++        let watchTargets = try watchApps.flatMap { watch in [watch] + (try watch.watchExtensions()) }
++        let watchRoot = appBundle.fileURL.appendingPathComponent("Watch").resolvingSymlinksInPath()
++
+         func profile(for app: AppBundle) -> ProvisioningProfile? {
+             for p in profiles where p.bundleIdentifier == app.bundleIdentifier {
+                 return p
+             }
++            if watchTargets.contains(app) { return nil }
+             return profiles.first
+         }
+ 
+@@ -111,6 +116,11 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
+                                 verboseLog("[SideSign] Group: '\(group)'")
+                                 throw SignerError.invalidApp(cause: "The keychain access group '\(group)' does not contain a Team ID prefix.")
+                             }
++                            if watchTargets.contains(app),
++                               group == applicationEntitlements["application-identifier"] as? String,
++                               let resignedID = matchedProfile.entitlements["application-identifier"] as? String {
++                                return resignedID
++                            }
+                             return matchedProfile.teamIdentifier + group[separator...]
+                         }
+                     }
+@@ -151,6 +161,20 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
+                 try prepare(ext)
+             }
+ 
++            for target in watchTargets {
++                try prepare(target)
++            }
++            var watchEntitlements: [String: String] = [:]
++            for target in watchTargets {
++                guard let executable = target.infoPlist["CFBundleExecutable"] as? String,
++                      let xml = entitlementsByURL[target.fileURL.resolvingSymlinksInPath()] else {
++                    throw SignerError.invalidApp(cause: "Invalid Watch executable in \(target.bundleIdentifier)")
++                }
++                let root = target.fileURL.resolvingSymlinksInPath()
++                watchEntitlements[root.path] = xml
++                watchEntitlements[root.appendingPathComponent(executable).path] = xml
++            }
++            let sealedWatchEntitlements = watchEntitlements
+             let keyData = try keyStore.exportP12()
+ 
+             verboseLog("[SideSign] Invoking CodeSigner.sign for appPath: \(appBundle.fileURL.path)")
+@@ -171,6 +195,11 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
+                         let url: URL = normPath.hasPrefix("/") ? URL(fileURLWithPath: normPath) : appBundle.fileURL.appendingPathComponent(normPath)
+                         let resolved = url.resolvingSymlinksInPath()
+ 
++                        if !watchApps.isEmpty && resolved.path.hasPrefix(watchRoot.path + "/") {
++                            // CodeSignKit visits children before their parents. Frameworks and loose
++                            // libraries inside a watch app must not inherit application entitlements.
++                            return sealedWatchEntitlements[resolved.path] ?? ""
++                        }
+                         if resolved == appResolved {
+                             targetType = .mainAppBundleDirectory
+                             xml = entitlementsByURL[appResolved] ?? ""
+diff --git a/Sources/DeveloperPortal/Devices.swift b/Sources/DeveloperPortal/Devices.swift
+index 98b0659..ab6d90b 100644
+--- a/Sources/DeveloperPortal/Devices.swift
++++ b/Sources/DeveloperPortal/Devices.swift
+@@ -14,7 +14,8 @@ public extension DeveloperPortal {
+         debugLog("[SideSign] fetchDevices starting...")
+         verboseLog("[SideSign] Team: \(team.name) (\(team.identifier))")
+ 
+-        let response: ListDevicesResponse = try await sendRequest(url: Constants.URLs.listDevices, session: session, team: team)
++        let parameters = types == .appleWatch ? ["DTDK_Platform": "watchos"] : [:]
++        let response: ListDevicesResponse = try await sendRequest(url: Constants.URLs.listDevices, additionalParameters: parameters, session: session, team: team)
+ 
+         let devices = (response.devices ?? []).filter { types.contains($0.type) }
+ 
+@@ -44,6 +45,8 @@ public extension DeveloperPortal {
+ 
+         if type.contains(.iPhone) || type.contains(.iPad) {
+             parameters["DTDK_Platform"] = "ios"
++        } else if type.contains(.appleWatch) {
++            parameters["DTDK_Platform"] = "watchos"
+         } else if type.contains(.appleTV) {
+             parameters["DTDK_Platform"] = "tvos"
+             parameters["subPlatform"] = "tvOS"
+diff --git a/Sources/DeveloperPortal/Profiles.swift b/Sources/DeveloperPortal/Profiles.swift
+index 6c68dab..2d3f740 100644
+--- a/Sources/DeveloperPortal/Profiles.swift
++++ b/Sources/DeveloperPortal/Profiles.swift
+@@ -203,6 +203,8 @@ public extension DeveloperPortal {
+         var parameters = ["appIdId": appID.identifier]
+         if let subPlatform = subPlatform {
+             parameters["subPlatform"] = subPlatform
++        } else if deviceType.contains(.appleWatch) {
++            parameters["DTDK_Platform"] = "watchos"
+         } else if deviceType.contains(.appleTV) {
+             parameters["subPlatform"] = "tvOS"
+         } else if deviceType.contains(.mac) {
+diff --git a/Sources/Models/AppBundle.swift b/Sources/Models/AppBundle.swift
+index acf0c02..fe77604 100644
+--- a/Sources/Models/AppBundle.swift
++++ b/Sources/Models/AppBundle.swift
+@@ -3,7 +3,7 @@
+ //  SideSign
+ //
+ //  Created by Magesh K on 30/08/26.
+-//  Copyright © 2026 SideSign. All rights reserved.
++//  Copyright 漏 2026 SideSign. All rights reserved.
+ //
+ 
+ import Foundation
+@@ -34,6 +34,33 @@ public struct AppBundle: Sendable, Identifiable, Hashable, Equatable {
+         loadExtensions()
+     }
+ 
++    /// The watch app and its extensions are separate provisioning targets.
++    public func watchApplications() throws -> [AppBundle] {
++        try nestedBundles(in: "Watch", extension: "app")
++    }
++
++    public func watchExtensions() throws -> [AppBundle] {
++        try nestedBundles(in: "PlugIns", extension: "appex")
++    }
++
++    private func nestedBundles(in folder: String, extension suffix: String) throws -> [AppBundle] {
++        let root = fileURL.resolvingSymlinksInPath()
++        let container = root.appendingPathComponent(folder)
++        guard FileManager.default.fileExists(atPath: container.path) else { return [] }
++        guard container.resolvingSymlinksInPath().path == container.path else {
++            throw SignerError.invalidApp(cause: "Invalid nested bundle directory: \(folder)")
++        }
++        let children = try FileManager.default.contentsOfDirectory(at: container, includingPropertiesForKeys: nil)
++        return try children.filter { $0.pathExtension.lowercased() == suffix }
++            .sorted { $0.path < $1.path }.map { url in
++                guard url.resolvingSymlinksInPath().path == url.path,
++                      let bundle = AppBundle(fileURL: url) else {
++                    throw SignerError.invalidApp(cause: "Invalid embedded bundle: \(url.lastPathComponent)")
++                }
++                return bundle
++            }
++    }
++
+     public var isExtension: Bool {
+         fileURL.pathExtension.lowercased() == "appex"
+     }
+diff --git a/Tests/SideSignTests/WatchCompanionTests.swift b/Tests/SideSignTests/WatchCompanionTests.swift
+new file mode 100644
+index 0000000..020308c
+--- /dev/null
++++ b/Tests/SideSignTests/WatchCompanionTests.swift
+@@ -0,0 +1,29 @@
++import Foundation
++import XCTest
++@testable import SideSign
++
++final class WatchCompanionTests: XCTestCase {
++    func testDiscoversWatchAndItsExtensionsSeparatelyFromPhonePlugins() throws {
++        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++        defer { try? FileManager.default.removeItem(at: temp) }
++        func makeBundle(_ path: String, _ id: String) throws -> AppBundle {
++            let directory = temp.appendingPathComponent(path)
++            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++            let info = ["CFBundleIdentifier": id, "CFBundleExecutable": "Binary", "CFBundlePackageType": "APPL"]
++            let bytes = try PropertyListSerialization.data(fromPropertyList: info, format: .binary, options: 0)
++            try bytes.write(to: directory.appendingPathComponent("Info.plist"))
++            return try XCTUnwrap(AppBundle(fileURL: directory))
++        }
++        let host = try makeBundle("Example.app", "org.example.phone")
++        XCTAssertTrue(try host.watchApplications().isEmpty)
++        let watch = try makeBundle("Example.app/Watch/Companion.app", "org.example.phone.watch")
++        let ext = try makeBundle("Example.app/Watch/Companion.app/PlugIns/Logic.appex", "org.example.phone.watch.logic")
++        _ = try makeBundle("Example.app/PlugIns/Widget.appex", "org.example.phone.widget")
++        XCTAssertEqual(try host.watchApplications().map(\.bundleIdentifier), [watch.bundleIdentifier])
++        XCTAssertEqual(try watch.watchExtensions().map(\.bundleIdentifier), [ext.bundleIdentifier])
++        XCTAssertEqual(host.appExtensions.map(\.bundleIdentifier), ["org.example.phone.widget"])
++        let bad = host.fileURL.appendingPathComponent("Watch/Broken.app")
++        try FileManager.default.createDirectory(at: bad, withIntermediateDirectories: true)
++        XCTAssertThrowsError(try host.watchApplications())
++    }
++}
