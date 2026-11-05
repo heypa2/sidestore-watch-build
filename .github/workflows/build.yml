@@ -1,0 +1,43 @@
+name: Build SideStore with watchOS companions
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  ipa:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: SideStore/SideStore
+          ref: cd260851ae99bf1fc946b123db24e89c8cd21dc6
+          path: upstream
+          submodules: recursive
+          persist-credentials: false
+      - name: Apply reviewed patches
+        run: |
+          git -C upstream apply ../sidestore.patch
+          git -C upstream/Dependencies/SideSign apply ../../../sidesign.patch
+      - name: Select Xcode and install packaging tools
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_27.2.app
+          xcodebuild -version
+          brew install ldid
+      - name: Build the IPA
+        working-directory: upstream
+        run: |
+          make build
+          make fakesign ipa
+          unzip -t SideStore.ipa
+          mv SideStore.ipa ../SideStore-Watch.ipa
+      - name: Save IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-Watch
+          path: SideStore-Watch.ipa
+          retention-days: 7
+      - name: Check companion discovery
+        run: swift test --package-path upstream/Dependencies/SideSign --filter WatchCompanionTests
